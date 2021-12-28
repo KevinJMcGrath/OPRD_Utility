@@ -1,2 +1,4 @@
 jsonpickle
 simple-salesforce
+Faker
+python-dateutil
