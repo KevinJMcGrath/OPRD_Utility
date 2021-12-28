@@ -103,7 +103,7 @@ def create_account():
     company_name = fake.company()
 
     account_payload = {
-        'Name': company_name,
+        'Name': f"OPRD - {company_name}",
         'Type': 'AlphaSense Internal'
     }
 
