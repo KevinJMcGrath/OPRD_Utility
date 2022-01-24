@@ -19,6 +19,6 @@ def init_client_from_config():
     d = config.Salesforce.domain
 
     logging.info(f'Logging into SFDC client ({n})')
-    ss = simple_salesforce.Salesforce(username=u, password=p, security_token=s, domain=d)
+    ss = simple_salesforce.Salesforce(username=u, password=p, security_token=s, domain=d, version='52.0')
 
     return SFDCClient(ss)

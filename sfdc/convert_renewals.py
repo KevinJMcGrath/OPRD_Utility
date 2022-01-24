@@ -3,6 +3,7 @@ import logging
 
 import sfdc
 
+from datetime import datetime, date
 from dateutil import parser
 from dateutil.relativedelta import relativedelta
 from pathlib import Path
@@ -163,7 +164,91 @@ def get_pending_renewals():
 
     return { o['Id']: o for o in opps }
 
+def convert_renewals_from_SFDC():
+    migration_id = 'sfdc-01-20'
+    price_book_id = '01s3g000000IeHr'
+    record_type_id = '0123g000000PP5G'  # Renewal
+
+    soql = "SELECT Id, Id_18__c, StageName, Type, Contract_Length_Months__c, Contract_Start_Date__c, "
+    soql += " Contract_End_Date__c, ASV__c, Effective_Date__c, AccountId, Subscription__c, CloseDate, "
+    soql += " Primary_Contact__c "
+    soql += " FROM Opportunity "
+    soql += " WHERE IsClosed = false AND "
+    soql += " Type IN ('Renewal (full term)', 'Renewal (contract/email required)', 'Pending Partial Cancel')"
+
+    opps = sfdc.sfdc_client.query(soql)
+
+    logging.info(f"Opportunities pending migration: {len(opps)}")
+
+    contract_rqrd_opps = [o['Id'] for o in opps if o['Type'] == 'Renewal (contract/email required)']
+
+    opps_for_update = []
+    subs_for_insert = []
+    for o in opps:
+        o_id = o['Id']
+        a_id = o['AccountId']
+        stage = o['StageName']
+        o_type = o['Type']
+        close_date = o['CloseDate']
+        term = int(float(o['Contract_Length_Months__c'])) if o['Contract_Length_Months__c'] else 12
+        eff_date_str = o['Effective_Date__c'] if o['Effective_Date__c'] else o['CloseDate']
+
+        eff_date = parser.parse(eff_date_str)
+        contract_start_date = eff_date
+        contract_end_date = contract_start_date + relativedelta(months=term, days=-1)
+
+        prim_contact_id = o['Primary_Contact__c']
+
+        p = {
+            'Id': o_id,
+            'RecordTypeId': record_type_id,
+            'Type': 'Renewal',
+            'StageName': 'Open',
+            'Contract_Start_Date__c': contract_start_date.date().isoformat(),
+            'Contract_End_Date__c': contract_end_date.date().isoformat(),
+            'PriceBook2Id': price_book_id,
+            'Migration_Id__c': migration_id,
+            'Decision_Maker__c': prim_contact_id
+        }
+
+        opps_for_update.append(p)
+
+
+        sub = {
+            'Account__c': a_id,
+            'Status__c': 'Active Client',
+            'Description__c': o_id,
+            'Migration_Id__c': migration_id,
+            'Renewal_Conditions__c': 'Auto-Renewal',
+            'Decision_Maker__c': prim_contact_id
+        }
+
+        if o['Id'] in contract_rqrd_opps:
+            sub['Renewal_Conditions__c'] = 'Explicit Confirmation Required'
+
+        subs_for_insert.append(sub)
+
+    results = sfdc.sfdc_client.inner_client.bulk.Subscription__c.insert(subs_for_insert)
+    success_ids, err_list = process_sfdc_errors(results)
+
+    soql = f"SELECT Id, Description__c FROM Subscription__c WHERE Migration_Id__c = '{migration_id}'"
+    subs = sfdc.sfdc_client.query(soql)
+
+    for sub in subs:
+        s_id = sub['Id']
+        s_o_id = sub['Description__c']
+
+        for o in opps_for_update:
+            if o['Id'] == s_o_id:
+                o['Subscription__c'] = s_id
+
+    results = sfdc.sfdc_client.inner_client.bulk.Opportunity.update(opps_for_update)
+    success_ids, err_list = process_sfdc_errors(results)
+
+    link_contacts_to_sub(migration_id, is_renewal=True)
+
 def convert_renewals(status_set: list, migration_id: str, skip_products: bool):
+    logging.info('Starting Migration for statuses: ' + ', '.join(status_set))
     logging.info('Loading Opps pending migration...')
     pending_renewals = get_pending_renewals()
 
@@ -172,7 +257,9 @@ def convert_renewals(status_set: list, migration_id: str, skip_products: bool):
     prepare_renewals(status_set, migration_id, skip_products, pending_renewals)
     insert_subscriptions(migration_id, contract_rqrd_opps)
     link_opps_to_sub(migration_id)
-    link_contacts_to_sub(migration_id)
+    link_contacts_to_sub(migration_id, True)
+
+    logging.info('Done!')
 
 def prepare_renewals(status_set: list, migration_id: str, skip_products: bool, pending_renewals: dict):
     price_book_id = '01s3g000000IeHr'
@@ -232,29 +319,48 @@ def prepare_renewals(status_set: list, migration_id: str, skip_products: bool, p
 
     logging.info(f'Updating Opps ({len(opps_for_update)})...')
     i = 0
-    loop_param = True
-    while loop_param:
+    while True:
         start_i = i
         end_i = i + 49
 
         if start_i > len(opps_for_update):
             break
 
+        if len(opps_for_update) < end_i:
+            end_i = len(opps_for_update) - 1
+
         logging.info(f"Sending rows {start_i} to {end_i}...")
 
         sfdc.sfdc_client.inner_client.bulk.Opportunity.update(opps_for_update[start_i:end_i])
 
-        if not skip_products:
-            logging.info('Inserting Line Items...')
+        i += 50
+
+
+    if not skip_products:
+        i = 0
+        logging.info('Inserting Line Items...')
+        while True:
+            start_i = i
+            end_i = i + 49
+
+            if start_i > len(products_for_insert):
+                break
+
+            if len(products_for_insert) < end_i:
+                end_i = len(products_for_insert) - 1
+
+
+            logging.info(f'Sending Line Items {start_i} to {end_i}...')
 
             sfdc.sfdc_client.inner_client.bulk.OpportunityLineItem.insert(products_for_insert[start_i:end_i])
 
-        i += 50
+            i += 50
+
 
 def insert_subscriptions(migration_id: str, contract_required_opps: list):
     subs_for_insert = []
 
-    soql = 'SELECT Id, AccountId, Subscription__c FROM Opportunity WHERE'
+    soql = 'SELECT Id, AccountId, Subscription__c, Primary_Contact__c FROM Opportunity WHERE'
     soql += f" Migration_Id__c = '{migration_id}' AND Subscription__c = NULL"
 
     opps = sfdc.sfdc_client.query(soql)
@@ -269,6 +375,9 @@ def insert_subscriptions(migration_id: str, contract_required_opps: list):
 
         if o['Id'] in contract_required_opps:
             p['Renewal_Conditions__c'] = 'Explicit Confirmation Required'
+
+        if o['Primary_Contact__c']:
+            p['Decision_Maker__c'] = o['Primary_Contact__c']
 
         subs_for_insert.append(p)
 
@@ -312,30 +421,35 @@ def link_opps_to_sub(migration_id: str):
         if start_i > len(opps_for_update):
             break
 
+        if len(opps_for_update) < end_i:
+            end_i = len(opps_for_update) - 1
+
         logging.info(f"Sending rows {start_i} to {end_i}...")
 
         sfdc.sfdc_client.inner_client.bulk.Opportunity.update(opps_for_update[start_i:end_i])
 
         i += 50
 
-    logging.info('Done!')
 
-def link_contacts_to_sub(migration_id: str):
+def link_contacts_to_sub(migration_id: str, is_renewal: bool=False):
     logging.info('Loading Contacts for Sub Update...')
-    soql = f"SELECT Id, Opportunity__r.Subscription__c FROM Contact WHERE Opportunity__r.Migration_Id__c = '{migration_id}'"
+    field_name = 'Renewal_Opportunity__r' if is_renewal else 'Opportunity__r'
+    soql = f"SELECT Id, Renewal_Opportunity__r.Subscription__c, Opportunity__r.Subscription__c " \
+           f"FROM Contact WHERE Subscription__c = NULL AND {field_name}.Migration_Id__c = '{migration_id}'"
     contacts = sfdc.sfdc_client.query(soql)
 
     contacts_for_update = []
     for c in contacts:
         p = {
             'Id': c['Id'],
-            'Subscription__c': c['Opportunity__r']['Subscription__c']
+            'Subscription__c': c[field_name]['Subscription__c']
         }
 
         contacts_for_update.append(p)
 
+    logging.info(f"Updating Contacts ({len(contacts_for_update)})...")
     sfdc.sfdc_client.inner_client.bulk.Contact.update(contacts_for_update)
-    logging.info('Done!')
+
 
 def get_products(row):
     o_id = row['Opportunity CaseSafe ID']
@@ -439,3 +553,29 @@ def get_products(row):
         prod_list.append(p)
 
     return prod_list
+
+def process_sfdc_errors(sfdc_results):
+    filename = f"migration_error_log_{date.today().isoformat()}.txt"
+    err_path = Path(r"C:\Users\Kevin\Downloads\AlphaSense") / filename
+
+    success_ids = []
+    error_list = []
+
+    index = 0
+    for r in sfdc_results:
+        if r['success']:
+            success_ids.append(r['id'])
+        else:
+            for err in r['errors']:
+                err_str =f"{index} | Status Code: {err['statusCode']} | Message: {err['message']}"
+                error_list.append(err_str)
+
+        index += 1
+
+    logging.info(f"Last Transaction Error Count: {len(error_list)}")
+
+    if error_list:
+        with open(err_path, 'a') as err_file:
+            err_file.writelines(error_list)
+
+    return success_ids, error_list

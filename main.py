@@ -1,6 +1,6 @@
 import package_logger
 
-from sfdc import setup, breakdown, convert_newsub, convert_renewals, adjustments
+from sfdc import setup, breakdown, convert_newsub, convert_renewals, adjustments, account_recon
 
 package_logger.initialize_logging()
 
@@ -14,16 +14,20 @@ def conversion():
     # New Sub Record Type Id: 0123g000000PP5Q
     # Renewal Record Type Id: 0123g000000PP5G
 
-    status_set = ['no product in migration - batch 2']
-    migration_id = 'b3-noprod2'
-    skip_prods = True
+    status_set = ['Migration Ready - Batch 2']
+    migration_id = 'b3-multi2'
+    skip_prods = False
 
-    convert_renewals.convert_renewals(status_set=status_set, migration_id=migration_id, skip_products=skip_prods)
+    # convert_renewals.convert_renewals(status_set=status_set, migration_id=migration_id, skip_products=skip_prods)
+    # convert_renewals.link_contacts_to_sub(migration_id, True)
 
+    convert_renewals.convert_renewals_from_SFDC()
 
 def adjust():
-    opp_id = '0063g00000AlPL4AAN'
-    adjustments.copy_contacts_to_sub(opp_id=opp_id, is_renewal=True)
+    adjustments.product_line_adjust()
 
 if __name__ == '__main__':
-    conversion()
+    acct_id = '0013200001FCjZT' #  Sanofi Genzyme
+    account_recon.recon_account(account_id=acct_id, output_to_csv=True)
+    # adjust()
+    # conversion()
